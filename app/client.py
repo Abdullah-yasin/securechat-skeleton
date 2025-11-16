@@ -1,12 +1,8 @@
 """Simple TCP client for certificate handshake (no TLS yet)."""
 
-from app.common.secure_channel import encrypt_envelope, decrypt_envelope
-
-from app.crypto import dh, symmetric
-import base64
-
 import socket
 import json
+import base64
 
 from cryptography.hazmat.primitives import serialization
 from cryptography import x509
@@ -17,6 +13,8 @@ from app.crypto.pki import (
     load_ca_certificate,
     verify_peer_certificate,
 )
+from app.crypto import dh
+from app.common.secure_channel import encrypt_envelope, decrypt_envelope
 
 
 def send_json(sock, obj):
@@ -43,8 +41,7 @@ def load_certificate_bytes(cert_bytes: bytes) -> x509.Certificate:
 
 def main():
     # Load keys/certs
-    # (client_key not used yet, but will be needed for signatures later)
-    client_key = load_private_key("certs/client.key")
+    client_key = load_private_key("certs/client.key")  # not yet used, but kept for later
     client_cert = load_certificate("certs/client.crt")
     ca_cert = load_ca_certificate()
 
@@ -58,6 +55,7 @@ def main():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.connect((HOST, PORT))
 
+        # ---------- Certificate handshake ----------
         try:
             # 1. Send client_hello with client cert PEM
             send_json(
@@ -93,10 +91,7 @@ def main():
             print(f"Handshake failed: {e}")
             return  # Abort on failed handshake
 
-        # ---- Ephemeral Diffie–Hellman key exchange ----
-        import base64
-        from app.crypto import dh
-
+        # ---------- Ephemeral Diffie–Hellman + encrypted register/login ----------
         try:
             # 1) Generate an ephemeral keypair
             cli_priv, cli_pub = dh.generate_keypair()
@@ -133,39 +128,38 @@ def main():
 
             # 6) Derive the 16-byte AES session key
             session_key = dh.derive_aes_key_from_shared(shared)
-
-            # 7) Print message about session key
             print(f"Client derived session key of length {len(session_key)} bytes")
 
-            # 1) Prompt the user for credentials
-            username = input("Username to register: ")
+            # 7) Ask user for action
+            mode = input("Action (register/login): ").strip().lower()
+            if mode not in ("register", "login"):
+                print("Error: Action must be 'register' or 'login'")
+                return
+
+            # 8) Prompt for credentials
+            username = input("Username: ")
             password = input("Password: ")
 
-            # 2) Build payload
+            # 9) Build payload
             payload = {
-                "kind": "register",
+                "kind": mode,
                 "username": username,
                 "password": password,
             }
 
-            # 3) Encrypt the payload in an envelope
-            from app.common.secure_channel import encrypt_envelope, decrypt_envelope
-            envelope = encrypt_envelope(session_key, payload)
+            # 10) Encrypt and send
+            env = encrypt_envelope(session_key, payload)
+            send_json(sock, env)
 
-            # 4) Send the envelope to the server
-            send_json(sock, envelope)
-
-            # 5) Wait for a response from the server (receive envelope)
+            # 11) Receive and decrypt response
             resp_env = recv_json(sock)
-
-            # 6) Decrypt envelope response
             resp_payload = decrypt_envelope(session_key, resp_env)
 
-            # 7) Print the response
+            # 12) Print server response
             print("Server response:", resp_payload)
+
         except Exception as e:
-            print(f"Diffie–Hellman exchange failed: {e}")
-            return
+            print(f"Client error during DH or secure exchange: {e}")
 
 
 if __name__ == "__main__":
