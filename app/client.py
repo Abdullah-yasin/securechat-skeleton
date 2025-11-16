@@ -13,7 +13,7 @@ from app.crypto.pki import (
     load_ca_certificate,
     verify_peer_certificate,
 )
-from app.crypto import dh
+from app.crypto import dh, symmetric
 from app.common.secure_channel import encrypt_envelope, decrypt_envelope
 
 
@@ -41,7 +41,7 @@ def load_certificate_bytes(cert_bytes: bytes) -> x509.Certificate:
 
 def main():
     # Load keys/certs
-    client_key = load_private_key("certs/client.key")  # not yet used, but kept for later
+    client_key = load_private_key("certs/client.key")  # reserved for later
     client_cert = load_certificate("certs/client.crt")
     ca_cert = load_ca_certificate()
 
@@ -91,7 +91,7 @@ def main():
             print(f"Handshake failed: {e}")
             return  # Abort on failed handshake
 
-        # ---------- Ephemeral Diffie–Hellman + encrypted register/login ----------
+        # ---------- Ephemeral X25519 DH + encrypted register/login ----------
         try:
             # 1) Generate an ephemeral keypair
             cli_priv, cli_pub = dh.generate_keypair()
@@ -157,6 +157,47 @@ def main():
 
             # 12) Print server response
             print("Server response:", resp_payload)
+
+            # ---------- If login successful, start chat-session DH ----------
+            if mode == "login" and resp_payload.get("status") == "ok":
+                # 1) Receive server's chat DH params + A, encrypted with control session_key
+                dh_env = recv_json(sock)
+                dh_payload = decrypt_envelope(session_key, dh_env)
+
+                if dh_payload.get("kind") != "chat_dh_params":
+                    print("Unexpected payload instead of chat_dh_params:", dh_payload)
+                    return
+
+                p = int(dh_payload["p"])
+                g = int(dh_payload["g"])
+                A = int(dh_payload["A"])
+
+                # 2) Generate client's classic DH keypair
+                cli_priv_chat, cli_pub_chat = dh.classic_generate_keypair()
+
+                # 3) Derive shared secret and chat AES key
+                shared_int = dh.classic_derive_shared(cli_priv_chat, A)
+                chat_key = dh.classic_derive_aes_key_from_shared(shared_int)
+                print(f"Client chat key length: {len(chat_key)} bytes")
+
+                # 4) Send B back to server under control session_key
+                chat_resp = {
+                    "kind": "chat_dh_response",
+                    "B": str(cli_pub_chat),
+                }
+                resp_env2 = encrypt_envelope(session_key, chat_resp)
+                send_json(sock, resp_env2)
+
+                # 5) Ask user for a chat message, encrypt with chat_key, send
+                text = input("Enter chat message to send: ")
+                chat_msg = {"type": "chat_msg", "text": text}
+                chat_env = encrypt_envelope(chat_key, chat_msg)
+                send_json(sock, chat_env)
+
+                # 6) Receive encrypted ACK under chat_key
+                ack_env = recv_json(sock)
+                ack_payload = decrypt_envelope(chat_key, ack_env)
+                print("Server chat ACK:", ack_payload)
 
         except Exception as e:
             print(f"Client error during DH or secure exchange: {e}")

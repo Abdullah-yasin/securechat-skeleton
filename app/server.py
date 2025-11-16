@@ -1,8 +1,5 @@
 """Simple TCP server with certificate handshake + DH + encrypted REGISTER/LOGIN."""
 
-from app.storage.users import create_user, get_user
-
-from app.common.secure_channel import encrypt_envelope, decrypt_envelope
 import os
 import hashlib
 import socket
@@ -12,6 +9,8 @@ import base64
 from cryptography.hazmat.primitives import serialization
 from cryptography import x509
 
+from app.storage.users import create_user, get_user
+from app.common.secure_channel import encrypt_envelope, decrypt_envelope
 from app.crypto import dh
 from app.crypto.pki import (
     load_private_key,
@@ -46,7 +45,6 @@ def handle_login(payload: dict) -> dict:
     return {"status": "ok", "message": "login successful"}
 
 
-
 def send_json(sock, obj):
     data = json.dumps(obj).encode("utf-8") + b"\n"
     sock.sendall(data)
@@ -71,7 +69,7 @@ def load_certificate_bytes(cert_bytes: bytes) -> x509.Certificate:
 
 
 def handle_client(conn, addr, server_cert_pem: str, ca_cert):
-    """Handle one client: cert handshake + DH + encrypted REGISTER/LOGIN."""
+    """Handle one client: cert handshake + DH + encrypted REGISTER/LOGIN + chat."""
     print(f"Accepted connection from {addr}")
 
     try:
@@ -105,7 +103,7 @@ def handle_client(conn, addr, server_cert_pem: str, ca_cert):
             },
         )
 
-        # ---- Ephemeral Diffie–Hellman key exchange ----
+        # ---- Ephemeral Diffie–Hellman key exchange (X25519) ----
 
         # 1) Receive client's DH public key
         dh_msg = recv_json(conn)
@@ -123,16 +121,16 @@ def handle_client(conn, addr, server_cert_pem: str, ca_cert):
             raise ValueError("Failed to base64-decode client DH public key")
 
         # 2) Generate ephemeral keypair
-        srv_priv, srv_pub = dh.generate_keypair()
+        srv_priv_ctrl, srv_pub_ctrl = dh.generate_keypair()
 
         # 3) Compute shared secret
-        shared = dh.derive_shared_secret(srv_priv, client_pub_bytes)
+        shared = dh.derive_shared_secret(srv_priv_ctrl, client_pub_bytes)
 
         # 4) Derive 16-byte AES session key
         session_key = dh.derive_aes_key_from_shared(shared)
 
         # 5) Send back server's DH public key (base64-encoded)
-        srv_pub_b64 = base64.b64encode(srv_pub).decode("ascii")
+        srv_pub_b64 = base64.b64encode(srv_pub_ctrl).decode("ascii")
         send_json(
             conn,
             {
@@ -155,6 +153,8 @@ def handle_client(conn, addr, server_cert_pem: str, ca_cert):
         # 3) Read kind
         kind = payload.get("kind")
 
+        do_chat = False  # track whether we should start chat DH
+
         if kind == "register":
             if (
                 not isinstance(payload, dict)
@@ -167,7 +167,6 @@ def handle_client(conn, addr, server_cert_pem: str, ca_cert):
                 password = payload["password"]
 
                 # generate salt + hash
-                import os
                 salt = os.urandom(16)
                 salt_hex = salt.hex()
                 hash_hex = hash_password(password, salt)
@@ -181,12 +180,56 @@ def handle_client(conn, addr, server_cert_pem: str, ca_cert):
 
         elif kind == "login":
             resp = handle_login(payload)
+            if resp.get("status") == "ok":
+                do_chat = True  # only start chat after successful login
+
         else:
             resp = {"status": "error", "message": "unknown payload kind"}
 
         # Encrypt response and send
         resp_env = encrypt_envelope(session_key, resp)
         send_json(conn, resp_env)
+
+        # ---------- Chat session DH + one encrypted message ----------
+        if do_chat:
+            # 1) Server generates classic DH keypair for CHAT (separate from control DH)
+            srv_priv_chat, srv_pub_chat = dh.classic_generate_keypair()
+
+            # 2) Send DH params + server pub to client, encrypted with control session_key
+            chat_dh_msg = {
+                "kind": "chat_dh_params",
+                "p": str(dh.CLASSIC_P),
+                "g": str(dh.CLASSIC_G),
+                "A": str(srv_pub_chat),
+            }
+            env_dh = encrypt_envelope(session_key, chat_dh_msg)
+            send_json(conn, env_dh)
+
+            # 3) Receive client's DH response (B)
+            env2 = recv_json(conn)
+            chat_resp = decrypt_envelope(session_key, env2)
+            if chat_resp.get("kind") != "chat_dh_response" or "B" not in chat_resp:
+                raise ValueError("Invalid chat_dh_response")
+
+            B = int(chat_resp["B"])
+
+            # 4) Derive chat shared secret and AES key
+            shared_int = dh.classic_derive_shared(srv_priv_chat, B)
+            chat_key = dh.classic_derive_aes_key_from_shared(shared_int)
+            print(f"Server chat key length: {len(chat_key)} bytes")
+
+            # 5) Receive one encrypted chat message under chat_key
+            env3 = recv_json(conn)
+            chat_payload = decrypt_envelope(chat_key, env3)
+            if chat_payload.get("type") == "chat_msg":
+                print("Client says:", chat_payload.get("text"))
+
+                # 6) Send encrypted ACK under chat_key
+                ack = {"type": "chat_ack", "message": "message received"}
+                ack_env = encrypt_envelope(chat_key, ack)
+                send_json(conn, ack_env)
+            else:
+                print("Unexpected chat payload:", chat_payload)
 
     except Exception as e:
         print(f"Fatal server error for {addr}: {e}")
@@ -199,8 +242,7 @@ def handle_client(conn, addr, server_cert_pem: str, ca_cert):
 
 def main():
     # Load keys/certs
-    # (server_key not used yet, but we’ll need it later for signatures)
-    server_key = load_private_key("certs/server.key")
+    server_key = load_private_key("certs/server.key")  # reserved for signatures later
     server_cert = load_certificate("certs/server.crt")
     ca_cert = load_ca_certificate()
 
