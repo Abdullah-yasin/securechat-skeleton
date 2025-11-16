@@ -1,5 +1,8 @@
 """Simple TCP server with certificate handshake (no TLS yet)."""
 
+from app.crypto import dh, symmetric
+import base64
+
 import socket
 import json
 
@@ -90,6 +93,47 @@ def main():
                         "cert": server_cert_pem,
                     },
                 )
+
+                # ---- Ephemeral Diffie–Hellman key exchange ----
+                import base64
+                from app.crypto import dh
+
+                # 1) Receive client's DH public key
+                dh_msg = recv_json(conn)
+                if not (
+                    isinstance(dh_msg, dict)
+                    and dh_msg.get("type") == "dh_client_key"
+                    and "pub" in dh_msg
+                ):
+                    raise ValueError("Invalid dh_client_key message format")
+
+                client_pub_b64 = dh_msg["pub"]
+                try:
+                    client_pub_bytes = base64.b64decode(client_pub_b64)
+                except Exception:
+                    raise ValueError("Failed to base64-decode client DH public key")
+
+                # 2) Generate ephemeral keypair
+                srv_priv, srv_pub = dh.generate_keypair()
+
+                # 3) Compute shared secret
+                shared = dh.derive_shared_secret(srv_priv, client_pub_bytes)
+
+                # 4) Derive 16-byte AES session key
+                session_key = dh.derive_aes_key_from_shared(shared)
+
+                # 5) Send back server's DH public key (base64-encoded)
+                srv_pub_b64 = base64.b64encode(srv_pub).decode("ascii")
+                send_json(
+                    conn,
+                    {
+                        "type": "dh_server_key",
+                        "pub": srv_pub_b64,
+                    }
+                )
+
+                # 6) Print session key info
+                print(f"Server derived session key of length {len(session_key)} bytes")
 
                 # Connection remains open for further protocol
                 print("Handshake complete, ready for next phase.")

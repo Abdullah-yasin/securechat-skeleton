@@ -1,5 +1,8 @@
 """Simple TCP client for certificate handshake (no TLS yet)."""
 
+from app.crypto import dh, symmetric
+import base64
+
 import socket
 import json
 
@@ -86,6 +89,54 @@ def main():
 
         except Exception as e:
             print(f"Handshake failed: {e}")
+            return  # Abort on failed handshake
+
+        # ---- Ephemeral Diffie–Hellman key exchange ----
+        import base64
+        from app.crypto import dh
+
+        try:
+            # 1) Generate an ephemeral keypair
+            cli_priv, cli_pub = dh.generate_keypair()
+
+            # 2) Send JSON to the server with our public key (base64-encoded)
+            cli_pub_b64 = base64.b64encode(cli_pub).decode("ascii")
+            send_json(
+                sock,
+                {
+                    "type": "dh_client_key",
+                    "pub": cli_pub_b64,
+                }
+            )
+
+            # 3) Receive server's DH public key in JSON
+            dh_msg = recv_json(sock)
+            if not (
+                isinstance(dh_msg, dict)
+                and dh_msg.get("type") == "dh_server_key"
+                and "pub" in dh_msg
+            ):
+                raise ValueError("Invalid dh_server_key message format")
+
+            srv_pub_b64 = dh_msg["pub"]
+
+            # 4) Decode the server pubkey from base64
+            try:
+                srv_pub_bytes = base64.b64decode(srv_pub_b64)
+            except Exception:
+                raise ValueError("Failed to base64-decode server DH public key")
+
+            # 5) Compute the shared secret
+            shared = dh.derive_shared_secret(cli_priv, srv_pub_bytes)
+
+            # 6) Derive the 16-byte AES session key
+            session_key = dh.derive_aes_key_from_shared(shared)
+
+            # 7) Print message about session key
+            print(f"Client derived session key of length {len(session_key)} bytes")
+        except Exception as e:
+            print(f"Diffie–Hellman exchange failed: {e}")
+            return
 
 
 if __name__ == "__main__":
