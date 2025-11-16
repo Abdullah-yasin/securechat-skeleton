@@ -5,13 +5,16 @@ import hashlib
 import socket
 import json
 import base64
+from datetime import datetime, timezone
 
 from cryptography.hazmat.primitives import serialization
 from cryptography import x509
 
 from app.storage.users import create_user, get_user
+from app.storage.transcript import Transcript, make_transcript_hash
 from app.common.secure_channel import encrypt_envelope, decrypt_envelope
 from app.crypto import dh
+from app.crypto import sign as rsasign
 from app.crypto.pki import (
     load_private_key,
     load_certificate,
@@ -68,9 +71,13 @@ def load_certificate_bytes(cert_bytes: bytes) -> x509.Certificate:
     return x509.load_pem_x509_certificate(cert_bytes)
 
 
-def handle_client(conn, addr, server_cert_pem: str, ca_cert):
-    """Handle one client: cert handshake + DH + encrypted REGISTER/LOGIN + chat."""
+def handle_client(conn, addr, server_cert_pem: str, ca_cert, server_key, server_cert):
+    """Handle one client: cert handshake + DH + encrypted REGISTER/LOGIN + chat + receipt."""
     print(f"Accepted connection from {addr}")
+
+    # Per-connection transcript
+    transcript = Transcript()
+    username_for_receipt = None
 
     try:
         # ---- Certificate handshake ----
@@ -93,6 +100,11 @@ def handle_client(conn, addr, server_cert_pem: str, ca_cert):
         )
 
         print("Client certificate validated successfully; sending server_hello.")
+        transcript.add_event(
+            "server",
+            "client_cert_ok",
+            {"peer": addr[0]},
+        )
 
         # Send server_hello with server PEM cert
         send_json(
@@ -177,11 +189,18 @@ def handle_client(conn, addr, server_cert_pem: str, ca_cert):
                     resp = {"status": "error", "message": "user already exists"}
                 else:
                     resp = {"status": "ok", "message": "user registered"}
+                    transcript.add_event("server", "register_ok", {"user": username})
+                    username_for_receipt = username
 
         elif kind == "login":
+            username = payload.get("username", "").strip()
             resp = handle_login(payload)
             if resp.get("status") == "ok":
                 do_chat = True  # only start chat after successful login
+                transcript.add_event("server", "login_ok", {"user": username})
+                username_for_receipt = username
+            else:
+                transcript.add_event("server", "login_fail", {"user": username})
 
         else:
             resp = {"status": "error", "message": "unknown payload kind"}
@@ -222,14 +241,39 @@ def handle_client(conn, addr, server_cert_pem: str, ca_cert):
             env3 = recv_json(conn)
             chat_payload = decrypt_envelope(chat_key, env3)
             if chat_payload.get("type") == "chat_msg":
-                print("Client says:", chat_payload.get("text"))
-
+                text = chat_payload.get("text", "")
+                print("Client says:", text)
+                transcript.add_event("client", "chat_msg", {"len": len(text)})
                 # 6) Send encrypted ACK under chat_key
                 ack = {"type": "chat_ack", "message": "message received"}
                 ack_env = encrypt_envelope(chat_key, ack)
                 send_json(conn, ack_env)
             else:
                 print("Unexpected chat payload:", chat_payload)
+
+            # ---------- Build transcript hash + signed SessionReceipt ----------
+            if username_for_receipt is not None:
+                th = make_transcript_hash(transcript)
+                receipt = {
+                    "user": username_for_receipt,
+                    "peer": addr[0],
+                    "issued_at": datetime.now(timezone.utc).isoformat(),
+                    "transcript_hash": {
+                        "alg": th.algorithm,
+                        "value": th.value_hex,
+                    },
+                }
+
+                signature = rsasign.sign_json(server_key, receipt)
+                valid = rsasign.verify_json(
+                    server_cert.public_key(),
+                    receipt,
+                    signature,
+                )
+
+                print("SessionReceipt:", receipt)
+                print("SessionReceipt signature (hex):", signature.hex())
+                print("SessionReceipt signature valid?", valid)
 
     except Exception as e:
         print(f"Fatal server error for {addr}: {e}")
@@ -242,7 +286,7 @@ def handle_client(conn, addr, server_cert_pem: str, ca_cert):
 
 def main():
     # Load keys/certs
-    server_key = load_private_key("certs/server.key")  # reserved for signatures later
+    server_key = load_private_key("certs/server.key")
     server_cert = load_certificate("certs/server.crt")
     ca_cert = load_ca_certificate()
 
@@ -263,7 +307,7 @@ def main():
             try:
                 conn, addr = srv.accept()
                 with conn:
-                    handle_client(conn, addr, server_cert_pem, ca_cert)
+                    handle_client(conn, addr, server_cert_pem, ca_cert, server_key, server_cert)
             except KeyboardInterrupt:
                 print("Server shutting down on Ctrl+C")
                 break
