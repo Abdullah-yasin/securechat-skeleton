@@ -1,5 +1,7 @@
 """Simple TCP server with certificate handshake + DH + encrypted REGISTER/LOGIN."""
 
+from app.storage.users import create_user, get_user
+
 from app.common.secure_channel import encrypt_envelope, decrypt_envelope
 import os
 import hashlib
@@ -18,8 +20,6 @@ from app.crypto.pki import (
     verify_peer_certificate,
 )
 
-USERS = {}  # username -> (salt_hex, hash_hex)
-
 
 def hash_password(password: str, salt: bytes) -> str:
     return hashlib.sha256(salt + password.encode("utf-8")).hexdigest()
@@ -32,10 +32,11 @@ def handle_login(payload: dict) -> dict:
     if not username or not password:
         return {"status": "error", "message": "missing username or password"}
 
-    if username not in USERS:
+    user_row = get_user(username)
+    if user_row is None:
         return {"status": "error", "message": "no such user"}
 
-    salt_hex, stored_hash = USERS[username]
+    salt_hex, stored_hash = user_row
     salt = bytes.fromhex(salt_hex)
     computed_hash = hash_password(password, salt)
 
@@ -43,6 +44,7 @@ def handle_login(payload: dict) -> dict:
         return {"status": "error", "message": "invalid password"}
 
     return {"status": "ok", "message": "login successful"}
+
 
 
 def send_json(sock, obj):
@@ -164,13 +166,17 @@ def handle_client(conn, addr, server_cert_pem: str, ca_cert):
                 username = payload["username"]
                 password = payload["password"]
 
-                if username in USERS:
+                # generate salt + hash
+                import os
+                salt = os.urandom(16)
+                salt_hex = salt.hex()
+                hash_hex = hash_password(password, salt)
+
+                # try to insert into DB
+                ok = create_user(username, salt_hex, hash_hex)
+                if not ok:
                     resp = {"status": "error", "message": "user already exists"}
                 else:
-                    salt = os.urandom(16)
-                    salt_hex = salt.hex()
-                    hash_hex = hash_password(password, salt)
-                    USERS[username] = (salt_hex, hash_hex)
                     resp = {"status": "ok", "message": "user registered"}
 
         elif kind == "login":
@@ -181,9 +187,6 @@ def handle_client(conn, addr, server_cert_pem: str, ca_cert):
         # Encrypt response and send
         resp_env = encrypt_envelope(session_key, resp)
         send_json(conn, resp_env)
-
-        # Debug print
-        print("USERS dict:", USERS)
 
     except Exception as e:
         print(f"Fatal server error for {addr}: {e}")
