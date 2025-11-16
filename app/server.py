@@ -1,5 +1,8 @@
 """Simple TCP server with certificate handshake (no TLS yet)."""
 
+from app.common.secure_channel import encrypt_envelope, decrypt_envelope
+import os, hashlib
+
 from app.crypto import dh, symmetric
 import base64
 
@@ -15,6 +18,11 @@ from app.crypto.pki import (
     load_ca_certificate,
     verify_peer_certificate,
 )
+
+USERS = {}  # username -> (salt_hex, hash_hex)
+
+def hash_password(password: str, salt: bytes) -> str:
+    return hashlib.sha256(salt + password.encode("utf-8")).hexdigest()
 
 
 def send_json(sock, obj):
@@ -135,8 +143,45 @@ def main():
                 # 6) Print session key info
                 print(f"Server derived session key of length {len(session_key)} bytes")
 
-                # Connection remains open for further protocol
-                print("Handshake complete, ready for next phase.")
+                # 1) Receive an envelope from the client
+                env = recv_json(conn)
+
+                from app.common.secure_channel import encrypt_envelope, decrypt_envelope
+                import os
+
+                # 2) Decrypt envelope
+                payload = decrypt_envelope(session_key, env)
+
+                # 3/4) Validate payload structure
+                if (
+                    not isinstance(payload, dict)
+                    or payload.get("kind") != "register"
+                    or not payload.get("username")
+                    or not payload.get("password")
+                ):
+                    raise ValueError("Invalid register payload")
+
+                username = payload["username"]
+                password = payload["password"]
+
+                global USERS  # already defined at module level
+
+                if username in USERS:
+                    resp = {"status": "error", "message": "user already exists"}
+                else:
+                    salt = os.urandom(16)
+                    salt_hex = salt.hex()
+                    hash_hex = hash_password(password, salt)
+                    USERS[username] = (salt_hex, hash_hex)
+                    resp = {"status": "ok", "message": "user registered"}
+
+                # 6) Encrypt response and send
+                resp_env = encrypt_envelope(session_key, resp)
+                send_json(conn, resp_env)
+
+                # 7) Print USERS dict for debugging
+                print("USERS dict:", USERS)
+
 
             except ValueError as ve:
                 print(f"CERT ERROR: {ve}")

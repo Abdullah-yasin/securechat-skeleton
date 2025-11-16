@@ -1,5 +1,7 @@
 """Simple TCP client for certificate handshake (no TLS yet)."""
 
+from app.common.secure_channel import encrypt_envelope, decrypt_envelope
+
 from app.crypto import dh, symmetric
 import base64
 
@@ -134,6 +136,33 @@ def main():
 
             # 7) Print message about session key
             print(f"Client derived session key of length {len(session_key)} bytes")
+
+            # 1) Prompt the user for credentials
+            username = input("Username to register: ")
+            password = input("Password: ")
+
+            # 2) Build payload
+            payload = {
+                "kind": "register",
+                "username": username,
+                "password": password,
+            }
+
+            # 3) Encrypt the payload in an envelope
+            from app.common.secure_channel import encrypt_envelope, decrypt_envelope
+            envelope = encrypt_envelope(session_key, payload)
+
+            # 4) Send the envelope to the server
+            send_json(sock, envelope)
+
+            # 5) Wait for a response from the server (receive envelope)
+            resp_env = recv_json(sock)
+
+            # 6) Decrypt envelope response
+            resp_payload = decrypt_envelope(session_key, resp_env)
+
+            # 7) Print the response
+            print("Server response:", resp_payload)
         except Exception as e:
             print(f"Diffie–Hellman exchange failed: {e}")
             return
