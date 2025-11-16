@@ -1,0 +1,16 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Certificates & secrets
+certs/
+*.key
+*.crt
+*.pem
+.env
+
+# Editor/OS
+.vscode/
+.idea/
+.DS_Store
